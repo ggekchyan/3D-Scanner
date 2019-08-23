@@ -1,0 +1,460 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4022.18">
+  <POU Name="MAIN" Id="{38793115-a9d5-4b1c-aeb4-ff764e41c0a5}" SpecialFunc="None">
+    <Declaration><![CDATA[PROGRAM MAIN
+VAR	
+	heartbeat : DINT;
+	
+axis1		: AXIS_REF;
+axis2		: AXIS_REF;
+
+scanStartButton AT %I* : BOOL; //scan start
+bMoveInput AT %I* : BOOL; //Movement Enable
+bStopInput1 AT %I* : BOOL; //stopping input for axis 1
+bStopInput2 AT %I* : BOOL; //stopping input for axis 2
+bHomeInput AT %I* : BOOL; //homing input
+axis1Home AT %I* : BOOL; //homing cam for axis 1
+axis2Home AT %I* : BOOL; //homing cam for axis 2
+bScanLight AT %I* : BOOL; // [for simulation] red alarm state to simulate laser scanning
+bAuto AT %I* : BOOL; //auto run
+trigger : BOOL;
+
+
+McPower1 : MC_Power;
+McPower2 : MC_Power;
+McReset1 : MC_Reset;
+McReset2 : MC_Reset;
+McJogging1 : MC_Jog;
+McJogging2 : MC_Jog;
+McVelocity : MC_MoveVelocity;
+McStop : MC_Stop;
+McHalt : MC_Halt;
+McHome1 : MC_Home;
+McHome2 : MC_Home;
+McMoveAbs : MC_MoveAbsolute;
+McRelative : MC_MoveRelative;
+
+//may not be necessary
+prox : BOOL;
+
+iState : DINT;
+iStep : DINT := 1;
+
+	//ReadStatus: INT;
+	//Done: INT;
+	//Error: INT;
+	//Status: INT;
+	//Busy: INT;
+	
+	
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[
+axis1.ReadStatus();
+axis2.ReadStatus();
+
+heartbeat := heartbeat + 1;
+IF heartbeat > 10000 THEN
+	heartbeat := 0;
+END_IF
+
+trigger := axis2.Status.PositiveDirection;
+
+
+//Initiate Functions
+McPower1(Axis:=axis1, Enable:=TRUE, Enable_Positive:=TRUE, Enable_Negative:=TRUE);
+McPower2(Axis:=axis2, Enable:=TRUE, Enable_Positive:=TRUE, Enable_Negative:=TRUE);
+McReset1(Axis:=axis1);
+McReset2(Axis:=axis2);
+McJogging1(Axis:=axis1);
+McJogging2(Axis:=axis2);
+McHome1(Axis:=axis1);
+McHome2(Axis:=axis2);
+
+
+CASE iState OF 
+	
+	0:  
+		iState := 10;
+	
+		
+	10:	//Start Drive 1 Reset
+		McHome1(Axis:=axis1,Execute:=FALSE);
+		McHome2(Axis:=axis2,Execute:=FALSE);
+		McReset1(Axis:=axis1,Execute:=TRUE);
+		
+		//Check if Reset 1 is Done
+		IF McReset1.Done THEN
+			McReset1(Axis:=axis1,Execute:=FALSE);
+			
+			IF bStopInput1 THEN 	//Only if homing just Axis 1
+				bStopInput1:=FALSE;
+				iState:=115;
+			ELSIF NOT bStopInput1 AND NOT bMoveInput THEN 	//If reseting both axes
+				iState := 15;
+			ELSIF NOT bStopInput1 THEN
+				iState:=20;
+			END_IF			
+			
+		ELSIF McReset1.Error THEN
+			iState := 999;
+			
+		END_IF		
+		
+	15: //Start Drive 2 Reset
+		McReset2(Axis:=axis2,Execute:=TRUE);
+		
+		//Check if Reset 2 is Done
+		IF McReset2.Done THEN
+			McReset2(Axis:=axis2,Execute:=FALSE);
+			McJogging2.JogForward:=FALSE;
+			MCJogging2.JogBackwards:=FALSE;
+			iState:=20;
+		ELSIF McReset2.Error THEN
+			iState := 999;
+		END_IF		
+			
+	20:	// Wait For Drives to Reset
+		IF McPower1.Status AND McPower2.Status AND scanStartButton THEN
+			IF bMoveInput THEN
+				iState:=250;
+			END_IF
+			IF NOT bMoveInput THEN
+				iState :=100;
+			END_IF
+		END_IF
+	
+		
+		
+	// bCalibrationCam := axis1Home
+	100:  //Homing
+		McHome1(Axis:=axis1,Execute:= TRUE, HomingMode:=MC_HomingMode.MC_Direct);	//home axis to set reference to position w/o movement
+		McHome2(Axis:=axis2, Execute:=TRUE, HomingMode:=MC_HomingMode.MC_Direct);
+		
+		//Check Status of Homing
+		IF McHome1.Done AND McHome2.Done THEN
+			iState := 110;
+		END_IF
+		IF McHome1.Error OR McHome2.Error THEN
+			iState:=110;
+		END_IF	
+				
+	110: //Homing Started, wait to complete
+		IF McHome1.Done AND McHome2.Done AND NOT McHome1.Error AND NOT McHome2.Error THEN
+			McHome1(Axis:=axis1,Execute:= FALSE);
+			McHome2(Axis:=axis2, Execute:=FALSE);
+			bHomeInput:=FALSE;
+			iState := 200;
+		ELSIF McHome1.Error OR McHome2.Error THEN
+			McHome1(Axis:=axis1,Execute:= FALSE);
+			McHome2(Axis:=axis2, Execute:=FALSE);
+			iState := 999;
+		END_IF
+	
+		
+		
+	115: //Homing Only Axis 1
+		bStopInput1:=FALSE;
+		McHome1(Axis:=axis1,Execute:= TRUE, HomingMode:=MC_HomingMode.MC_Direct);	
+		
+		//Check if homing is done.
+		IF McHome1.Done THEN
+			McHome1(Axis:=axis1,Execute:= FALSE);
+			iState:=200;
+		END_IF		
+	
+	120: //Homing [Axis 1] Complete. Wait for reset.
+		IF McHome1.Done THEN
+			McHome1(Axis:=axis1,Execute:= FALSE);
+			iState:=200;
+		END_IF
+		
+		
+		
+	200: //Homing Complete. Ready to Run.
+		
+		//Stop Axis 1 and Wait for Command
+		McPower1(Axis:=axis1, Enable:=FALSE);
+		
+		IF NOT bStopInput1 AND NOT bMoveInput THEN	//only if reseting both axes
+			McPower2(Axis:=axis2, Enable:=FALSE);
+		END_IF
+		
+		//RESET Both Axes
+		IF bMoveInput OR bHomeInput THEN
+			McPower1(Axis:=axis1,Enable:=TRUE,Enable_Positive:=TRUE,Enable_Negative:=TRUE);
+			McPower2(Axis:=axis2,Enable:=TRUE,Enable_Positive:=TRUE,Enable_Negative:=TRUE);
+			iState := 10;
+		END_IF
+		
+		
+		
+	250: //Movement Command	
+		McJogging1(Axis:=axis1, Acceleration:=1000, Deceleration:=1000);
+		McJogging2(Axis:=axis2, Velocity:=1, Acceleration:=100, Deceleration:=100);
+			iState:=300;
+					
+	300: //Wait for Stop Movement Command	
+	
+		// [Axis 1] Set Degrees of Rotation
+		IF axis1.NcToPlc.ActPos>60 THEN
+			bStopInput1:=TRUE;
+			McJogging1(Axis:=axis1, JogForward:=FALSE, JogBackwards:=FALSE);
+			iState:=10;
+		END_IF
+		
+		// [Axis 1] Set Degrees of Rotation
+		IF axis1.NcToPlc.ActPos<-60 THEN
+			bStopInput1:=TRUE;
+			McJogging1(Axis:=axis1, JogForward:=FALSE, JogBackwards:=FALSE);
+			iState:=10;
+		END_IF
+		
+		// [Axis 2] Set Upper Bound for Movement in mm
+		IF McJogging2.JogForward AND axis2.NcToPlc.ActPos>14 THEN
+			bStopInput2:=TRUE;
+			McJogging1(Axis:=axis1, JogForward:=FALSE, JogBackwards:=FALSE);
+			iState:=15;
+		END_IF
+		
+		// [Axis 2] Set Lower Bound for Movement in mm
+		IF McJogging2.JogBackwards AND axis2.NcToPlc.ActPos<0 THEN
+			bStopInput2:=TRUE;
+			McJogging1(Axis:=axis1, JogForward:=FALSE, JogBackwards:=FALSE);
+			iState:=15;
+		END_IF
+		
+		//EMERGENCY STOP Bounds
+		IF McJogging2.JogForward AND axis2.NcToPlc.ActPos>35 THEN
+			bMoveInput:=FALSE;
+		END_IF		
+		IF McJogging2.JogBackwards AND axis2.NcToPlc.ActPos<-15 THEN
+			bMoveInput:=FALSE;
+		END_IF
+		
+				
+		//MANUALLY STOP AXES:
+		//STOP Both Axes
+		IF NOT bMoveInput THEN
+			McJogging1(Axis := axis1, JogForward := FALSE, JogBackwards:=FALSE);
+			McJogging2(Axis := axis2, JogForward := FALSE, JogBackwards:=FALSE,);
+			iState:=200;
+		END_IF
+			
+		//STOP Axis 1
+		IF bStopInput1 THEN
+			McJogging1(Axis := axis1, JogForward := FALSE, JogBackwards:=FALSE);
+			McPower1(Axis:=axis1, Enable:=FALSE);
+			iState:=325;
+		END_IF
+		
+		//STOP Axis 2
+		IF bStopInput2 THEN
+			McJogging2(Axis := axis2, JogForward := FALSE, JogBackwards:=FALSE,);
+			McPower2(Axis:=axis2, Enable:=FALSE);
+			iState:=350;
+		END_IF	
+		
+		//Automated Run if AUTO mode turned on
+		IF bAuto AND bStopInput2 AND iStep <= 6 THEN
+			McJogging1(Axis := axis1, JogForward := TRUE);
+			iStep:=iStep+1;
+		END_IF
+		IF bAuto AND bStopInput1 AND iStep <= 6 AND axis2.NcToPlc.ActPos>17 THEN
+			McJogging2(Axis := axis2, JogForward := FALSE, JogBackwards:=TRUE);
+		END_IF
+		IF	bAuto AND bStopInput1 AND iStep <= 6 AND axis2.NcToPlc.ActPos<0 THEN
+			McJogging2(Axis := axis2, JogForward := TRUE, JogBackwards:=FALSE);
+		END_IF
+		
+	325: //RESET Only Axis 1
+		IF scanStartButton THEN
+			McPower1(Axis:=axis1,Enable:=TRUE,Enable_Positive:=TRUE,Enable_Negative:=TRUE);
+			iState:=10;
+		END_IF
+			
+	350: //RESET Only Axis 2			
+		IF scanStartButton THEN
+			bStopInput2:=FALSE;
+			McPower2(Axis:=axis2,Enable:=TRUE,Enable_Positive:=TRUE,Enable_Negative:=TRUE);
+			iState:=15;
+		END_IF
+		
+	
+	999: // Handle Error
+		iState:=10; 	//reset and retry homing
+		
+END_CASE]]></ST>
+    </Implementation>
+    <LineIds Name="MAIN">
+      <LineId Id="760" Count="0" />
+      <LineId Id="268" Count="1" />
+      <LineId Id="272" Count="4" />
+      <LineId Id="1366" Count="0" />
+      <LineId Id="1368" Count="1" />
+      <LineId Id="763" Count="0" />
+      <LineId Id="279" Count="1" />
+      <LineId Id="592" Count="0" />
+      <LineId Id="281" Count="0" />
+      <LineId Id="593" Count="0" />
+      <LineId Id="282" Count="0" />
+      <LineId Id="594" Count="0" />
+      <LineId Id="283" Count="0" />
+      <LineId Id="702" Count="0" />
+      <LineId Id="762" Count="0" />
+      <LineId Id="287" Count="4" />
+      <LineId Id="757" Count="0" />
+      <LineId Id="293" Count="2" />
+      <LineId Id="701" Count="0" />
+      <LineId Id="296" Count="0" />
+      <LineId Id="595" Count="0" />
+      <LineId Id="297" Count="1" />
+      <LineId Id="577" Count="0" />
+      <LineId Id="966" Count="0" />
+      <LineId Id="784" Count="0" />
+      <LineId Id="789" Count="0" />
+      <LineId Id="785" Count="0" />
+      <LineId Id="787" Count="1" />
+      <LineId Id="970" Count="1" />
+      <LineId Id="786" Count="0" />
+      <LineId Id="967" Count="0" />
+      <LineId Id="300" Count="1" />
+      <LineId Id="968" Count="0" />
+      <LineId Id="302" Count="0" />
+      <LineId Id="607" Count="1" />
+      <LineId Id="644" Count="0" />
+      <LineId Id="612" Count="0" />
+      <LineId Id="705" Count="0" />
+      <LineId Id="614" Count="1" />
+      <LineId Id="650" Count="1" />
+      <LineId Id="617" Count="2" />
+      <LineId Id="616" Count="0" />
+      <LineId Id="303" Count="0" />
+      <LineId Id="305" Count="1" />
+      <LineId Id="537" Count="3" />
+      <LineId Id="307" Count="0" />
+      <LineId Id="541" Count="0" />
+      <LineId Id="309" Count="1" />
+      <LineId Id="1127" Count="1" />
+      <LineId Id="311" Count="0" />
+      <LineId Id="323" Count="3" />
+      <LineId Id="706" Count="0" />
+      <LineId Id="470" Count="0" />
+      <LineId Id="469" Count="0" />
+      <LineId Id="327" Count="0" />
+      <LineId Id="753" Count="2" />
+      <LineId Id="427" Count="0" />
+      <LineId Id="331" Count="2" />
+      <LineId Id="698" Count="0" />
+      <LineId Id="590" Count="0" />
+      <LineId Id="334" Count="2" />
+      <LineId Id="700" Count="0" />
+      <LineId Id="337" Count="2" />
+      <LineId Id="1119" Count="1" />
+      <LineId Id="943" Count="0" />
+      <LineId Id="951" Count="0" />
+      <LineId Id="946" Count="0" />
+      <LineId Id="955" Count="0" />
+      <LineId Id="1114" Count="0" />
+      <LineId Id="947" Count="2" />
+      <LineId Id="944" Count="0" />
+      <LineId Id="959" Count="3" />
+      <LineId Id="964" Count="0" />
+      <LineId Id="963" Count="0" />
+      <LineId Id="340" Count="0" />
+      <LineId Id="1121" Count="0" />
+      <LineId Id="1118" Count="0" />
+      <LineId Id="341" Count="0" />
+      <LineId Id="350" Count="0" />
+      <LineId Id="473" Count="1" />
+      <LineId Id="952" Count="1" />
+      <LineId Id="652" Count="0" />
+      <LineId Id="954" Count="0" />
+      <LineId Id="600" Count="0" />
+      <LineId Id="528" Count="0" />
+      <LineId Id="475" Count="0" />
+      <LineId Id="529" Count="0" />
+      <LineId Id="799" Count="0" />
+      <LineId Id="581" Count="0" />
+      <LineId Id="482" Count="0" />
+      <LineId Id="478" Count="0" />
+      <LineId Id="1122" Count="0" />
+      <LineId Id="1117" Count="0" />
+      <LineId Id="532" Count="0" />
+      <LineId Id="585" Count="0" />
+      <LineId Id="591" Count="0" />
+      <LineId Id="879" Count="0" />
+      <LineId Id="535" Count="0" />
+      <LineId Id="483" Count="0" />
+      <LineId Id="1192" Count="0" />
+      <LineId Id="1113" Count="0" />
+      <LineId Id="914" Count="0" />
+      <LineId Id="965" Count="0" />
+      <LineId Id="927" Count="0" />
+      <LineId Id="950" Count="0" />
+      <LineId Id="928" Count="0" />
+      <LineId Id="1207" Count="0" />
+      <LineId Id="1260" Count="4" />
+      <LineId Id="1259" Count="0" />
+      <LineId Id="1098" Count="0" />
+      <LineId Id="1111" Count="0" />
+      <LineId Id="1100" Count="3" />
+      <LineId Id="1099" Count="0" />
+      <LineId Id="1311" Count="0" />
+      <LineId Id="1112" Count="0" />
+      <LineId Id="1107" Count="3" />
+      <LineId Id="1106" Count="0" />
+      <LineId Id="1174" Count="0" />
+      <LineId Id="1187" Count="0" />
+      <LineId Id="1176" Count="0" />
+      <LineId Id="1179" Count="1" />
+      <LineId Id="1183" Count="0" />
+      <LineId Id="1186" Count="0" />
+      <LineId Id="1175" Count="0" />
+      <LineId Id="1105" Count="0" />
+      <LineId Id="1123" Count="0" />
+      <LineId Id="908" Count="0" />
+      <LineId Id="792" Count="2" />
+      <LineId Id="797" Count="0" />
+      <LineId Id="795" Count="1" />
+      <LineId Id="791" Count="0" />
+      <LineId Id="639" Count="0" />
+      <LineId Id="764" Count="0" />
+      <LineId Id="767" Count="0" />
+      <LineId Id="782" Count="0" />
+      <LineId Id="769" Count="0" />
+      <LineId Id="768" Count="0" />
+      <LineId Id="766" Count="0" />
+      <LineId Id="640" Count="0" />
+      <LineId Id="604" Count="1" />
+      <LineId Id="620" Count="0" />
+      <LineId Id="632" Count="0" />
+      <LineId Id="631" Count="0" />
+      <LineId Id="1193" Count="0" />
+      <LineId Id="1205" Count="0" />
+      <LineId Id="1194" Count="1" />
+      <LineId Id="1203" Count="0" />
+      <LineId Id="1196" Count="2" />
+      <LineId Id="770" Count="0" />
+      <LineId Id="1199" Count="1" />
+      <LineId Id="1124" Count="0" />
+      <LineId Id="800" Count="0" />
+      <LineId Id="771" Count="0" />
+      <LineId Id="777" Count="1" />
+      <LineId Id="780" Count="0" />
+      <LineId Id="772" Count="0" />
+      <LineId Id="661" Count="0" />
+      <LineId Id="634" Count="0" />
+      <LineId Id="622" Count="0" />
+      <LineId Id="637" Count="0" />
+      <LineId Id="623" Count="0" />
+      <LineId Id="625" Count="0" />
+      <LineId Id="606" Count="0" />
+      <LineId Id="1026" Count="0" />
+      <LineId Id="346" Count="2" />
+      <LineId Id="759" Count="0" />
+      <LineId Id="2" Count="0" />
+    </LineIds>
+  </POU>
+</TcPlcObject>
