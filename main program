@@ -1,0 +1,286 @@
+PROGRAM MAIN
+VAR	
+	heartbeat : DINT;
+	
+axis1		: AXIS_REF;
+axis2		: AXIS_REF;
+
+scanStartButton AT %I* : BOOL; //scan start
+bMoveInput AT %I* : BOOL; //Movement Enable
+bStopInput1 AT %I* : BOOL; //stopping input for axis 1
+bStopInput2 AT %I* : BOOL; //stopping input for axis 2
+bHomeInput AT %I* : BOOL; //homing input
+axis1Home AT %I* : BOOL; //homing cam for axis 1
+axis2Home AT %I* : BOOL; //homing cam for axis 2
+bScanLight AT %I* : BOOL; // [for simulation] red alarm state to simulate laser scanning
+bAuto AT %I* : BOOL; //auto run
+trigger : BOOL;
+
+
+McPower1 : MC_Power;
+McPower2 : MC_Power;
+McReset1 : MC_Reset;
+McReset2 : MC_Reset;
+McJogging1 : MC_Jog;
+McJogging2 : MC_Jog;
+McVelocity : MC_MoveVelocity;
+McStop : MC_Stop;
+McHalt : MC_Halt;
+McHome1 : MC_Home;
+McHome2 : MC_Home;
+McMoveAbs : MC_MoveAbsolute;
+McRelative : MC_MoveRelative;
+
+//may not be necessary
+prox : BOOL;
+
+iState : DINT;
+iStep : DINT := 1;
+
+	//ReadStatus: INT;
+	//Done: INT;
+	//Error: INT;
+	//Status: INT;
+	//Busy: INT;
+	
+	
+END_VAR
+
+
+
+
+axis1.ReadStatus();
+axis2.ReadStatus();
+
+heartbeat := heartbeat + 1;
+IF heartbeat > 10000 THEN
+	heartbeat := 0;
+END_IF
+
+trigger := axis2.Status.PositiveDirection;
+
+
+//Initiate Functions
+McPower1(Axis:=axis1, Enable:=TRUE, Enable_Positive:=TRUE, Enable_Negative:=TRUE);
+McPower2(Axis:=axis2, Enable:=TRUE, Enable_Positive:=TRUE, Enable_Negative:=TRUE);
+McReset1(Axis:=axis1);
+McReset2(Axis:=axis2);
+McJogging1(Axis:=axis1);
+McJogging2(Axis:=axis2);
+McHome1(Axis:=axis1);
+McHome2(Axis:=axis2);
+
+
+CASE iState OF 
+	
+	0:  
+		iState := 10;
+	
+		
+	10:	//Start Drive 1 Reset
+		McHome1(Axis:=axis1,Execute:=FALSE);
+		McHome2(Axis:=axis2,Execute:=FALSE);
+		McReset1(Axis:=axis1,Execute:=TRUE);
+		
+		//Check if Reset 1 is Done
+		IF McReset1.Done THEN
+			McReset1(Axis:=axis1,Execute:=FALSE);
+			
+			IF bStopInput1 THEN 	//Only if homing just Axis 1
+				bStopInput1:=FALSE;
+				iState:=115;
+			ELSIF NOT bStopInput1 AND NOT bMoveInput THEN 	//If reseting both axes
+				iState := 15;
+			ELSIF NOT bStopInput1 THEN
+				iState:=20;
+			END_IF			
+			
+		ELSIF McReset1.Error THEN
+			iState := 999;
+			
+		END_IF		
+		
+	15: //Start Drive 2 Reset
+		McReset2(Axis:=axis2,Execute:=TRUE);
+		
+		//Check if Reset 2 is Done
+		IF McReset2.Done THEN
+			McReset2(Axis:=axis2,Execute:=FALSE);
+			McJogging2.JogForward:=FALSE;
+			MCJogging2.JogBackwards:=FALSE;
+			iState:=20;
+		ELSIF McReset2.Error THEN
+			iState := 999;
+		END_IF		
+			
+	20:	// Wait For Drives to Reset
+		IF McPower1.Status AND McPower2.Status AND scanStartButton THEN
+			IF bMoveInput THEN
+				iState:=250;
+			END_IF
+			IF NOT bMoveInput THEN
+				iState :=100;
+			END_IF
+		END_IF
+	
+		
+		
+	// bCalibrationCam := axis1Home
+	100:  //Homing
+		McHome1(Axis:=axis1,Execute:= TRUE, HomingMode:=MC_HomingMode.MC_Direct);	//home axis to set reference to position w/o movement
+		McHome2(Axis:=axis2, Execute:=TRUE, HomingMode:=MC_HomingMode.MC_Direct);
+		
+		//Check Status of Homing
+		IF McHome1.Done AND McHome2.Done THEN
+			iState := 110;
+		END_IF
+		IF McHome1.Error OR McHome2.Error THEN
+			iState:=110;
+		END_IF	
+				
+	110: //Homing Started, wait to complete
+		IF McHome1.Done AND McHome2.Done AND NOT McHome1.Error AND NOT McHome2.Error THEN
+			McHome1(Axis:=axis1,Execute:= FALSE);
+			McHome2(Axis:=axis2, Execute:=FALSE);
+			bHomeInput:=FALSE;
+			iState := 200;
+		ELSIF McHome1.Error OR McHome2.Error THEN
+			McHome1(Axis:=axis1,Execute:= FALSE);
+			McHome2(Axis:=axis2, Execute:=FALSE);
+			iState := 999;
+		END_IF
+	
+		
+		
+	115: //Homing Only Axis 1
+		bStopInput1:=FALSE;
+		McHome1(Axis:=axis1,Execute:= TRUE, HomingMode:=MC_HomingMode.MC_Direct);	
+		
+		//Check if homing is done.
+		IF McHome1.Done THEN
+			McHome1(Axis:=axis1,Execute:= FALSE);
+			iState:=200;
+		END_IF		
+	
+	120: //Homing [Axis 1] Complete. Wait for reset.
+		IF McHome1.Done THEN
+			McHome1(Axis:=axis1,Execute:= FALSE);
+			iState:=200;
+		END_IF
+		
+		
+		
+	200: //Homing Complete. Ready to Run.
+		
+		//Stop Axis 1 and Wait for Command
+		McPower1(Axis:=axis1, Enable:=FALSE);
+		
+		IF NOT bStopInput1 AND NOT bMoveInput THEN	//only if reseting both axes
+			McPower2(Axis:=axis2, Enable:=FALSE);
+		END_IF
+		
+		//RESET Both Axes
+		IF bMoveInput OR bHomeInput THEN
+			McPower1(Axis:=axis1,Enable:=TRUE,Enable_Positive:=TRUE,Enable_Negative:=TRUE);
+			McPower2(Axis:=axis2,Enable:=TRUE,Enable_Positive:=TRUE,Enable_Negative:=TRUE);
+			iState := 10;
+		END_IF
+		
+		
+		
+	250: //Movement Command	
+		McJogging1(Axis:=axis1, Acceleration:=1000, Deceleration:=1000);
+		McJogging2(Axis:=axis2, Velocity:=1, Acceleration:=100, Deceleration:=100);
+			iState:=300;
+					
+	300: //Wait for Stop Movement Command	
+	
+		// [Axis 1] Set Degrees of Rotation
+		IF axis1.NcToPlc.ActPos>60 THEN
+			bStopInput1:=TRUE;
+			McJogging1(Axis:=axis1, JogForward:=FALSE, JogBackwards:=FALSE);
+			iState:=10;
+		END_IF
+		
+		// [Axis 1] Set Degrees of Rotation
+		IF axis1.NcToPlc.ActPos<-60 THEN
+			bStopInput1:=TRUE;
+			McJogging1(Axis:=axis1, JogForward:=FALSE, JogBackwards:=FALSE);
+			iState:=10;
+		END_IF
+		
+		// [Axis 2] Set Upper Bound for Movement in mm
+		IF McJogging2.JogForward AND axis2.NcToPlc.ActPos>14 THEN
+			bStopInput2:=TRUE;
+			McJogging1(Axis:=axis1, JogForward:=FALSE, JogBackwards:=FALSE);
+			iState:=15;
+		END_IF
+		
+		// [Axis 2] Set Lower Bound for Movement in mm
+		IF McJogging2.JogBackwards AND axis2.NcToPlc.ActPos<0 THEN
+			bStopInput2:=TRUE;
+			McJogging1(Axis:=axis1, JogForward:=FALSE, JogBackwards:=FALSE);
+			iState:=15;
+		END_IF
+		
+		//EMERGENCY STOP Bounds
+		IF McJogging2.JogForward AND axis2.NcToPlc.ActPos>35 THEN
+			bMoveInput:=FALSE;
+		END_IF		
+		IF McJogging2.JogBackwards AND axis2.NcToPlc.ActPos<-15 THEN
+			bMoveInput:=FALSE;
+		END_IF
+		
+				
+		//MANUALLY STOP AXES:
+		//STOP Both Axes
+		IF NOT bMoveInput THEN
+			McJogging1(Axis := axis1, JogForward := FALSE, JogBackwards:=FALSE);
+			McJogging2(Axis := axis2, JogForward := FALSE, JogBackwards:=FALSE,);
+			iState:=200;
+		END_IF
+			
+		//STOP Axis 1
+		IF bStopInput1 THEN
+			McJogging1(Axis := axis1, JogForward := FALSE, JogBackwards:=FALSE);
+			McPower1(Axis:=axis1, Enable:=FALSE);
+			iState:=325;
+		END_IF
+		
+		//STOP Axis 2
+		IF bStopInput2 THEN
+			McJogging2(Axis := axis2, JogForward := FALSE, JogBackwards:=FALSE,);
+			McPower2(Axis:=axis2, Enable:=FALSE);
+			iState:=350;
+		END_IF	
+		
+		//Automated Run if AUTO mode turned on
+		IF bAuto AND bStopInput2 AND iStep <= 6 THEN
+			McJogging1(Axis := axis1, JogForward := TRUE);
+			iStep:=iStep+1;
+		END_IF
+		IF bAuto AND bStopInput1 AND iStep <= 6 AND axis2.NcToPlc.ActPos>17 THEN
+			McJogging2(Axis := axis2, JogForward := FALSE, JogBackwards:=TRUE);
+		END_IF
+		IF	bAuto AND bStopInput1 AND iStep <= 6 AND axis2.NcToPlc.ActPos<0 THEN
+			McJogging2(Axis := axis2, JogForward := TRUE, JogBackwards:=FALSE);
+		END_IF
+		
+	325: //RESET Only Axis 1
+		IF scanStartButton THEN
+			McPower1(Axis:=axis1,Enable:=TRUE,Enable_Positive:=TRUE,Enable_Negative:=TRUE);
+			iState:=10;
+		END_IF
+			
+	350: //RESET Only Axis 2			
+		IF scanStartButton THEN
+			bStopInput2:=FALSE;
+			McPower2(Axis:=axis2,Enable:=TRUE,Enable_Positive:=TRUE,Enable_Negative:=TRUE);
+			iState:=15;
+		END_IF
+		
+	
+	999: // Handle Error
+		iState:=10; 	//reset and retry homing
+		
+END_CASE
